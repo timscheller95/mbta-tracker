@@ -1,0 +1,22 @@
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+  external_labels:
+    project: mbta-tracker
+
+scrape_configs:
+  # Scrape metrics exposed by the OTel Collector's Prometheus exporter
+  - job_name: otel-collector
+    scrape_interval: 30s
+    static_configs:
+      - targets:
+          - otel-collector:8889
+        labels:
+          collector: otel-contrib
+
+  # OTel Collector self-telemetry (optional, useful for debugging the pipeline)
+  - job_name: otel-collector-self
+    scrape_interval: 60s
+    static_configs:
+      - targets:
+          - otel-collector:8888
