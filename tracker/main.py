@@ -166,8 +166,15 @@ def _check_alerts(stop_id: str, direction_id: int) -> str | None:
         if attrs.get("lifecycle") not in ACTIVE_LIFECYCLES:
             continue
         effect = attrs.get("effect", "")
-        if effect in DISRUPTION_EFFECTS:
-            found.add(effect)
+        if effect not in DISRUPTION_EFFECTS:
+            continue
+        # Confirm the alert actually applies to the Orange route.
+        # The MBTA API can return alerts for other routes (e.g. Blue Line) that
+        # share a station with Orange Line stops, so we must verify here.
+        entities = attrs.get("informed_entity", [])
+        if not any(e.get("route") in ("Orange", None, "") for e in entities):
+            continue
+        found.add(effect)
 
     for effect in SEVERITY:
         if effect in found:
