@@ -4,3 +4,4 @@ opentelemetry-exporter-otlp-proto-http==1.25.0
 opentelemetry-instrumentation-requests==0.46b0
 requests==2.32.3
 tzdata==2024.1
+setuptools<80

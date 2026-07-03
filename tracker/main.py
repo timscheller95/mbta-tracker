@@ -6,7 +6,7 @@ commute hours and sends ntfy.sh push notifications when significant service
 issues (>10 min delays, no service) are detected or resolved.
 
 OpenTelemetry auto-instrumentation ships traces to Datadog APM for uptime
-monitoring. Notifications are handled entirely via ntfy.sh — no metrics are
+monitoring. Notifications are handled entirely via ntfy.sh -no metrics are
 shipped to Datadog.
 """
 
@@ -50,7 +50,7 @@ ET = ZoneInfo("America/New_York")
 DISRUPTION_EFFECTS = {"DELAY", "NO_SERVICE", "SUSPENSION", "STOP_CLOSURE"}
 ACTIVE_LIFECYCLES = {"NEW", "ONGOING", "ONGOING_UPCOMING"}
 
-# Ordered most-to-least severe — used to detect escalation
+# Ordered most-to-least severe -used to detect escalation
 SEVERITY = ["NO_SERVICE", "SUSPENSION", "STOP_CLOSURE", "DELAY"]
 
 # ── OTel / APM ────────────────────────────────────────────────────────────────
@@ -64,7 +64,7 @@ _tracer_provider = TracerProvider(resource=_resource)
 _tracer_provider.add_span_processor(BatchSpanProcessor(_trace_exporter))
 trace.set_tracer_provider(_tracer_provider)
 
-# Auto-instrument requests — every HTTP call (MBTA API + ntfy.sh) becomes a trace span
+# Auto-instrument requests -every HTTP call (MBTA API + ntfy.sh) becomes a trace span
 RequestsInstrumentor().instrument()
 
 tracer = trace.get_tracer(__name__)
@@ -91,7 +91,7 @@ class WatchWindow:
     start_hour: int         # ET hour, inclusive
     end_hour: int           # ET hour, exclusive
     ntfy_topic: str
-    # Runtime state — persists across polls, resets at window close or resolution
+    # Runtime state -persists across polls, resets at window close or resolution
     disrupted: bool = field(default=False)
     disruption_effect: str = field(default="")
 
@@ -266,7 +266,7 @@ def notify_disruption(window: WatchWindow, effect: str) -> None:
     label = _EFFECT_LABEL.get(effect, effect.lower().replace("_", " "))
     _ntfy_post(
         topic=window.ntfy_topic,
-        title=f"Orange Line Alert — {window.stop_name}",
+        title=f"Orange Line Alert - {window.stop_name}",
         body=f"Trains {window.direction_label} from {window.stop_name} are experiencing {label}.",
         priority="high",
         tags=["rotating_light", "orange_circle"],
@@ -277,8 +277,8 @@ def notify_escalation(window: WatchWindow, new_effect: str) -> None:
     label = _EFFECT_LABEL.get(new_effect, new_effect.lower().replace("_", " "))
     _ntfy_post(
         topic=window.ntfy_topic,
-        title=f"Orange Line Update — {window.stop_name}",
-        body=f"Update: trains {window.direction_label} from {window.stop_name} — now showing {label}.",
+        title=f"Orange Line Update - {window.stop_name}",
+        body=f"Update: trains {window.direction_label} from {window.stop_name} -now showing {label}.",
         priority="high",
         tags=["warning", "orange_circle"],
     )
@@ -287,7 +287,7 @@ def notify_escalation(window: WatchWindow, new_effect: str) -> None:
 def notify_resolved(window: WatchWindow) -> None:
     _ntfy_post(
         topic=window.ntfy_topic,
-        title=f"Orange Line Cleared — {window.stop_name}",
+        title=f"Orange Line Cleared - {window.stop_name}",
         body=f"Trains {window.direction_label} from {window.stop_name} appear to be running normally again.",
         priority="default",
         tags=["white_check_mark", "orange_circle"],
@@ -305,8 +305,8 @@ def is_active_window(window: WatchWindow, now_et: datetime) -> bool:
 def evaluate_window(window: WatchWindow, now_et: datetime) -> None:
     if not is_active_window(window, now_et):
         if window.disrupted:
-            # Window closed while a disruption was active — reset silently
-            logger.info("[%s] window closed while disrupted — resetting state", window.name)
+            # Window closed while a disruption was active -reset silently
+            logger.info("[%s] window closed while disrupted -resetting state", window.name)
             window.disrupted = False
             window.disruption_effect = ""
         return
@@ -358,6 +358,8 @@ def evaluate_window(window: WatchWindow, now_et: datetime) -> None:
 
 def poll_once() -> None:
     now_et = datetime.now(ET)
+    active = [w.name for w in WATCH_WINDOWS if is_active_window(w, now_et)]
+    logger.info("poll | %s ET | active windows: %s", now_et.strftime("%H:%M"), active or "none")
     with tracer.start_as_current_span("mbta.poll"):
         for window in WATCH_WINDOWS:
             evaluate_window(window, now_et)
