@@ -1,14 +1,12 @@
 services:
   mbta-monitor:
     build: ./tracker
-    restart: always        # auto-starts when Docker daemon starts (i.e. on every reboot)
+    restart: always
+    # host network gives the container direct access to localhost — required so the
+    # OTLP exporter can reach the Datadog Agent's HTTP receiver on port 4318.
+    network_mode: host
     env_file: .env
     environment:
-      DD_SAT: ${DD_SAT}
-      DD_SITE: ${DD_SITE:-datadoghq.com}
       NTFY_TOPIC_WIFE: ${NTFY_TOPIC_WIFE}
       NTFY_TOPIC_SELF: ${NTFY_TOPIC_SELF}
       POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-60}
-    # If cross-compiling on an x86 machine, uncomment the line below.
-    # When building directly on the Pi Zero, leave it commented out.
-    # platform: linux/arm/v6

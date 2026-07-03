@@ -28,20 +28,16 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-DD_SAT = os.environ["DD_SAT"]
-DD_SITE = os.getenv("DD_SITE", "datadoghq.com")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 NTFY_BASE = os.getenv("NTFY_BASE_URL", "https://ntfy.sh")
 NTFY_TOPIC_WIFE = os.environ["NTFY_TOPIC_WIFE"]
 NTFY_TOPIC_SELF = os.environ["NTFY_TOPIC_SELF"]
 DELAY_THRESHOLD_S = int(os.getenv("DELAY_THRESHOLD_SECONDS", "600"))  # 10 min
 
-# OTLP endpoint for Datadog APM. Override via OTEL_EXPORTER_OTLP_ENDPOINT if needed.
-# For US1 this resolves to https://api.datadoghq.com/api/intake/otlp/v1/traces
-OTLP_ENDPOINT = os.getenv(
-    "OTEL_EXPORTER_OTLP_ENDPOINT",
-    f"https://api.{DD_SITE}/api/intake/otlp",
-)
+# OTLP endpoint — points to the Datadog Agent's local HTTP receiver.
+# The Agent must have otlp_config.receiver.protocols.http.endpoint enabled.
+# Override via OTEL_EXPORTER_OTLP_ENDPOINT if the Agent is on a different host.
+OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318")
 
 ET = ZoneInfo("America/New_York")
 
@@ -56,10 +52,7 @@ SEVERITY = ["NO_SERVICE", "SUSPENSION", "STOP_CLOSURE", "DELAY"]
 # ── OTel / APM ────────────────────────────────────────────────────────────────
 
 _resource = Resource.create({SERVICE_NAME: "mbta-commute-monitor"})
-_trace_exporter = OTLPSpanExporter(
-    endpoint=OTLP_ENDPOINT,
-    headers={"Authorization": f"Bearer {DD_SAT}"},
-)
+_trace_exporter = OTLPSpanExporter(endpoint=OTLP_ENDPOINT)
 _tracer_provider = TracerProvider(resource=_resource)
 _tracer_provider.add_span_processor(BatchSpanProcessor(_trace_exporter))
 trace.set_tracer_provider(_tracer_provider)
@@ -374,10 +367,9 @@ def poll_once() -> None:
 
 def main() -> None:
     logger.info(
-        "MBTA commute monitor starting | poll=%ds | otlp=%s | sat=%s...",
+        "MBTA commute monitor starting | poll=%ds | otlp=%s",
         POLL_INTERVAL,
         OTLP_ENDPOINT,
-        DD_SAT[:8],
     )
 
     running = True
