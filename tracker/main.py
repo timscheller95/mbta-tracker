@@ -5,8 +5,7 @@ Polls the MBTA V3 API for Orange Line disruptions at specific stations during
 commute hours and sends ntfy.sh push notifications when significant service
 issues (>10 min delays, no service) are detected or resolved.
 
-Datadog APM auto-instrumentation (ddtrace) ships traces to the native Datadog
-Agent for uptime monitoring. Notifications are handled entirely via ntfy.sh.
+Pings healthchecks.io after each successful poll for uptime monitoring.
 """
 
 import logging
@@ -18,7 +17,6 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import requests
-from ddtrace import tracer
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -27,6 +25,7 @@ NTFY_BASE = os.getenv("NTFY_BASE_URL", "https://ntfy.sh")
 NTFY_TOPIC_1 = os.environ["NTFY_TOPIC_1"]
 NTFY_TOPIC_2 = os.environ["NTFY_TOPIC_2"]
 DELAY_THRESHOLD_S = int(os.getenv("DELAY_THRESHOLD_SECONDS", "600"))  # 10 min
+HEALTHCHECKS_URL = os.getenv("HEALTHCHECKS_URL", "")
 
 ET = ZoneInfo("America/New_York")
 
@@ -35,7 +34,7 @@ ET = ZoneInfo("America/New_York")
 DISRUPTION_EFFECTS = {"DELAY", "NO_SERVICE", "SUSPENSION", "STOP_CLOSURE"}
 ACTIVE_LIFECYCLES = {"NEW", "ONGOING", "ONGOING_UPCOMING"}
 
-# Ordered most-to-least severe -used to detect escalation
+# Ordered most-to-least severe — used to detect escalation
 SEVERITY = ["NO_SERVICE", "SUSPENSION", "STOP_CLOSURE", "DELAY"]
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -60,13 +59,12 @@ class WatchWindow:
     start_hour: int         # ET hour, inclusive
     end_hour: int           # ET hour, exclusive
     ntfy_topic: str
-    # Runtime state -persists across polls, resets at window close or resolution
+    # Runtime state — persists across polls, resets at window close or resolution
     disrupted: bool = field(default=False)
     disruption_effect: str = field(default="")
 
 
 WATCH_WINDOWS = [
-    # ── Wife ────────────────────────────────────────────────────────────────
     WatchWindow(
         name="topic1_morning",
         stop_id="place-forhl",
@@ -87,7 +85,6 @@ WATCH_WINDOWS = [
         end_hour=19,
         ntfy_topic=NTFY_TOPIC_1,
     ),
-    # ── Tim ─────────────────────────────────────────────────────────────────
     WatchWindow(
         name="topic2_morning",
         stop_id="place-masta",
@@ -240,45 +237,45 @@ def _ntfy_post(topic: str, title: str, body: str, priority: str, tags: list[str]
 
 def notify_disruption(window: WatchWindow, effect: str) -> None:
     label = _EFFECT_LABEL.get(effect, effect.lower().replace("_", " "))
-    with tracer.trace("alert.sent", resource="disruption") as span:
-        span.set_tag("window", window.name)
-        span.set_tag("stop", window.stop_id)
-        span.set_tag("effect", effect)
-        _ntfy_post(
-            topic=window.ntfy_topic,
-            title=f"Orange Line Alert - {window.stop_name}",
-            body=f"Trains {window.direction_label} from {window.stop_name} are experiencing {label}.",
-            priority="high",
-            tags=["rotating_light", "orange_circle"],
-        )
+    _ntfy_post(
+        topic=window.ntfy_topic,
+        title=f"Orange Line Alert - {window.stop_name}",
+        body=f"Trains {window.direction_label} from {window.stop_name} are experiencing {label}.",
+        priority="high",
+        tags=["rotating_light", "orange_circle"],
+    )
 
 
 def notify_escalation(window: WatchWindow, new_effect: str) -> None:
     label = _EFFECT_LABEL.get(new_effect, new_effect.lower().replace("_", " "))
-    with tracer.trace("alert.sent", resource="escalation") as span:
-        span.set_tag("window", window.name)
-        span.set_tag("stop", window.stop_id)
-        span.set_tag("effect", new_effect)
-        _ntfy_post(
-            topic=window.ntfy_topic,
-            title=f"Orange Line Update - {window.stop_name}",
-            body=f"Update: trains {window.direction_label} from {window.stop_name} -now showing {label}.",
-            priority="high",
-            tags=["warning", "orange_circle"],
-        )
+    _ntfy_post(
+        topic=window.ntfy_topic,
+        title=f"Orange Line Update - {window.stop_name}",
+        body=f"Update: trains {window.direction_label} from {window.stop_name} - now showing {label}.",
+        priority="high",
+        tags=["warning", "orange_circle"],
+    )
 
 
 def notify_resolved(window: WatchWindow) -> None:
-    with tracer.trace("alert.sent", resource="resolved") as span:
-        span.set_tag("window", window.name)
-        span.set_tag("stop", window.stop_id)
-        _ntfy_post(
-            topic=window.ntfy_topic,
-            title=f"Orange Line Cleared - {window.stop_name}",
-            body=f"Trains {window.direction_label} from {window.stop_name} appear to be running normally again.",
-            priority="default",
-            tags=["white_check_mark", "orange_circle"],
-        )
+    _ntfy_post(
+        topic=window.ntfy_topic,
+        title=f"Orange Line Cleared - {window.stop_name}",
+        body=f"Trains {window.direction_label} from {window.stop_name} appear to be running normally again.",
+        priority="default",
+        tags=["white_check_mark", "orange_circle"],
+    )
+
+
+# ── healthchecks.io ───────────────────────────────────────────────────────────
+
+def _ping_healthchecks() -> None:
+    if not HEALTHCHECKS_URL:
+        return
+    try:
+        requests.get(HEALTHCHECKS_URL, timeout=5)
+    except Exception as exc:
+        logger.warning("healthchecks.io ping failed: %s", exc)
 
 
 # ── Window Evaluation ─────────────────────────────────────────────────────────
@@ -292,8 +289,8 @@ def is_active_window(window: WatchWindow, now_et: datetime) -> bool:
 def evaluate_window(window: WatchWindow, now_et: datetime) -> None:
     if not is_active_window(window, now_et):
         if window.disrupted:
-            # Window closed while a disruption was active -reset silently
-            logger.info("[%s] window closed while disrupted -resetting state", window.name)
+            # Window closed while a disruption was active — reset silently
+            logger.info("[%s] window closed while disrupted — resetting state", window.name)
             window.disrupted = False
             window.disruption_effect = ""
         return
@@ -305,7 +302,6 @@ def evaluate_window(window: WatchWindow, now_et: datetime) -> None:
         return
 
     if effect and not window.disrupted:
-        # New disruption detected
         window.disrupted = True
         window.disruption_effect = effect
         try:
@@ -314,7 +310,6 @@ def evaluate_window(window: WatchWindow, now_et: datetime) -> None:
             logger.error("[%s] ntfy failed (disruption): %s", window.name, exc)
 
     elif effect and window.disrupted and effect != window.disruption_effect:
-        # Disruption escalated or changed character
         window.disruption_effect = effect
         try:
             notify_escalation(window, effect)
@@ -322,7 +317,6 @@ def evaluate_window(window: WatchWindow, now_et: datetime) -> None:
             logger.error("[%s] ntfy failed (escalation): %s", window.name, exc)
 
     elif not effect and window.disrupted:
-        # Disruption cleared within the active window
         window.disrupted = False
         window.disruption_effect = ""
         try:
@@ -348,6 +342,7 @@ def poll_once() -> None:
     logger.info("poll | %s ET | active windows: %s", now_et.strftime("%H:%M"), active or "none")
     for window in WATCH_WINDOWS:
         evaluate_window(window, now_et)
+    _ping_healthchecks()
 
 
 def main() -> None:

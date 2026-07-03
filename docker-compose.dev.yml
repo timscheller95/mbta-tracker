@@ -1,43 +1,13 @@
 services:
-  datadog-agent:
-    image: datadog/agent:latest
-    environment:
-      DD_API_KEY: ${DD_API_KEY}
-      DD_SITE: datadoghq.com
-      DD_APM_ENABLED: "true"
-      DD_APM_NON_LOCAL_TRAFFIC: "true"
-      DD_LOGS_ENABLED: "false"
-      DD_PROCESS_AGENT_ENABLED: "false"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-
-  mbta-monitor:
-    build: ./tracker
-    env_file: .env
-    environment:
-      NTFY_TOPIC_1: ${NTFY_TOPIC_1}
-      NTFY_TOPIC_2: ${NTFY_TOPIC_2}
-      POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-60}
-      DELAY_THRESHOLD_SECONDS: ${DELAY_THRESHOLD_SECONDS:-600}
-      DD_SERVICE: mbta-commute-monitor
-      DD_ENV: production
-      DD_AGENT_HOST: datadog-agent
-    depends_on:
-      - datadog-agent
-
   test:
     image: python:3.12-slim
     working_dir: /app
     volumes:
       - ./tracker:/app
     environment:
-      DD_AGENT_HOST: datadog-agent
-      DD_SERVICE: mbta-commute-monitor
-      DD_ENV: test
       NTFY_TOPIC_1: test-topic-1
       NTFY_TOPIC_2: test-topic-2
-    depends_on:
-      - datadog-agent
+      HEALTHCHECKS_URL: ${HEALTHCHECKS_URL:-}
     command: >
       bash -c "pip install -q -r requirements-dev.txt &&
                pytest tests/test_integration.py -v"
