@@ -4,8 +4,10 @@ services:
     restart: always        # auto-starts when Docker daemon starts (i.e. on every reboot)
     env_file: .env
     environment:
-      DD_API_KEY: ${DD_API_KEY}
+      DD_SAT: ${DD_SAT}
       DD_SITE: ${DD_SITE:-datadoghq.com}
+      NTFY_TOPIC_WIFE: ${NTFY_TOPIC_WIFE}
+      NTFY_TOPIC_SELF: ${NTFY_TOPIC_SELF}
       POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-60}
     # If cross-compiling on an x86 machine, uncomment the line below.
     # When building directly on the Pi Zero, leave it commented out.

@@ -1,50 +1,73 @@
 """
-MBTA Station Slowdown Monitor
-=============================
-Polls the MBTA V3 API every 60 s and emits three metrics to Datadog via OTLP:
+MBTA Orange Line Commute Monitor
+=================================
+Polls the MBTA V3 API for Orange Line disruptions at specific stations during
+commute hours and sends ntfy.sh push notifications when significant service
+issues (>10 min delays, no service) are detected or resolved.
 
-  mbta.station.alert_count         active service alerts (by station + effect)
-  mbta.station.next_train_minutes  minutes until next predicted train arrival
-  mbta.station.prediction_delay_s  seconds late vs. scheduled arrival
-
-Only Massachusetts Ave and State stations are tracked (Orange Line).
-Designed for Raspberry Pi Zero WH: one container, minimal resource use.
+OpenTelemetry auto-instrumentation ships traces to Datadog APM for uptime
+monitoring. Notifications are handled entirely via ntfy.sh — no metrics are
+shipped to Datadog.
 """
 
 import logging
 import os
 import signal
 import time
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import requests
-from opentelemetry import metrics
-from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
-from opentelemetry.metrics import Observation
-from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.requests import RequestsInstrumentor
 from opentelemetry.sdk.resources import SERVICE_NAME, Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-DD_API_KEY = os.environ["DD_API_KEY"]
+DD_SAT = os.environ["DD_SAT"]
 DD_SITE = os.getenv("DD_SITE", "datadoghq.com")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
+NTFY_BASE = os.getenv("NTFY_BASE_URL", "https://ntfy.sh")
+NTFY_TOPIC_WIFE = os.environ["NTFY_TOPIC_WIFE"]
+NTFY_TOPIC_SELF = os.environ["NTFY_TOPIC_SELF"]
+DELAY_THRESHOLD_S = int(os.getenv("DELAY_THRESHOLD_SECONDS", "600"))  # 10 min
 
-# Direct OTLP ingestion endpoint — override via OTEL_EXPORTER_OTLP_ENDPOINT if needed.
-# For US1 (datadoghq.com) this resolves to https://api.datadoghq.com/api/intake/otlp/v1/metrics
+# OTLP endpoint for Datadog APM. Override via OTEL_EXPORTER_OTLP_ENDPOINT if needed.
+# For US1 this resolves to https://api.datadoghq.com/api/intake/otlp/v1/traces
 OTLP_ENDPOINT = os.getenv(
     "OTEL_EXPORTER_OTLP_ENDPOINT",
     f"https://api.{DD_SITE}/api/intake/otlp",
 )
 
-TARGET_STOPS = {
-    "place-masta": "Massachusetts Ave",
-    "place-state": "State",
-}
+ET = ZoneInfo("America/New_York")
 
-DIRECTION_LABELS = {0: "southbound", 1: "northbound"}
+# Effects that constitute a service disruption for commuters.
+# Excludes elevator/escalator closures, policy changes, and general notices.
+DISRUPTION_EFFECTS = {"DELAY", "NO_SERVICE", "SUSPENSION", "STOP_CLOSURE"}
 ACTIVE_LIFECYCLES = {"NEW", "ONGOING", "ONGOING_UPCOMING"}
+
+# Ordered most-to-least severe — used to detect escalation
+SEVERITY = ["NO_SERVICE", "SUSPENSION", "STOP_CLOSURE", "DELAY"]
+
+# ── OTel / APM ────────────────────────────────────────────────────────────────
+
+_resource = Resource.create({SERVICE_NAME: "mbta-commute-monitor"})
+_trace_exporter = OTLPSpanExporter(
+    endpoint=OTLP_ENDPOINT,
+    headers={"Authorization": f"Bearer {DD_SAT}"},
+)
+_tracer_provider = TracerProvider(resource=_resource)
+_tracer_provider.add_span_processor(BatchSpanProcessor(_trace_exporter))
+trace.set_tracer_provider(_tracer_provider)
+
+# Auto-instrument requests — every HTTP call (MBTA API + ntfy.sh) becomes a trace span
+RequestsInstrumentor().instrument()
+
+tracer = trace.get_tracer(__name__)
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -55,206 +78,297 @@ logging.basicConfig(
 )
 logger = logging.getLogger("mbta.monitor")
 
-# ── OTel Setup ────────────────────────────────────────────────────────────────
-
-_resource = Resource.create({SERVICE_NAME: "mbta-station-monitor"})
-_exporter = OTLPMetricExporter(
-    endpoint=OTLP_ENDPOINT,
-    headers={"DD-API-KEY": DD_API_KEY},
-)
-_reader = PeriodicExportingMetricReader(
-    _exporter,
-    export_interval_millis=POLL_INTERVAL * 1000,
-)
-_meter_provider = MeterProvider(resource=_resource, metric_readers=[_reader])
-metrics.set_meter_provider(_meter_provider)
-meter = metrics.get_meter(__name__)
-
-# ── Shared State ──────────────────────────────────────────────────────────────
+# ── Watch Windows ─────────────────────────────────────────────────────────────
 
 
-class _State:
-    def __init__(self) -> None:
-        self.alert_counts: dict[tuple[str, str], int] = {}    # (station, effect) -> count
-        self.next_train: dict[tuple[str, str], float] = {}    # (station, direction) -> minutes
-        self.delay: dict[tuple[str, str], float] = {}         # (station, direction) -> seconds late
+@dataclass
+class WatchWindow:
+    name: str
+    stop_id: str
+    stop_name: str
+    direction_id: int       # 0 = southbound (Forest Hills), 1 = northbound (Oak Grove)
+    direction_label: str    # e.g. "northbound towards Oak Grove"
+    start_hour: int         # ET hour, inclusive
+    end_hour: int           # ET hour, exclusive
+    ntfy_topic: str
+    # Runtime state — persists across polls, resets at window close or resolution
+    disrupted: bool = field(default=False)
+    disruption_effect: str = field(default="")
 
 
-_state = _State()
-
-# ── Observable Gauge Callbacks ────────────────────────────────────────────────
-
-
-def _observe_alert_count(options):
-    for (station, effect), count in _state.alert_counts.items():
-        yield Observation(count, {"station": station, "effect": effect, "route": "Orange"})
-
-
-def _observe_next_train(options):
-    for (station, direction), minutes in _state.next_train.items():
-        yield Observation(minutes, {"station": station, "direction": direction, "route": "Orange"})
-
-
-def _observe_delay(options):
-    for (station, direction), delay_s in _state.delay.items():
-        yield Observation(delay_s, {"station": station, "direction": direction, "route": "Orange"})
-
-
-# ── Instruments ───────────────────────────────────────────────────────────────
-
-meter.create_observable_gauge(
-    "mbta.station.alert_count",
-    callbacks=[_observe_alert_count],
-    description="Active service alerts at each target station, tagged by effect type",
-    unit="{alert}",
-)
-
-meter.create_observable_gauge(
-    "mbta.station.next_train_minutes",
-    callbacks=[_observe_next_train],
-    description="Minutes until the next predicted train at each target station",
-    unit="min",
-)
-
-meter.create_observable_gauge(
-    "mbta.station.prediction_delay_s",
-    callbacks=[_observe_delay],
-    description="How many seconds late the next predicted train is vs. its schedule",
-    unit="s",
-)
+WATCH_WINDOWS = [
+    # ── Wife ────────────────────────────────────────────────────────────────
+    WatchWindow(
+        name="wife_morning",
+        stop_id="place-forhl",
+        stop_name="Forest Hills",
+        direction_id=1,
+        direction_label="northbound towards Oak Grove",
+        start_hour=8,
+        end_hour=10,
+        ntfy_topic=NTFY_TOPIC_WIFE,
+    ),
+    WatchWindow(
+        name="wife_evening",
+        stop_id="place-masta",
+        stop_name="Massachusetts Ave",
+        direction_id=0,
+        direction_label="southbound towards Forest Hills",
+        start_hour=16,
+        end_hour=19,
+        ntfy_topic=NTFY_TOPIC_WIFE,
+    ),
+    # ── Tim ─────────────────────────────────────────────────────────────────
+    WatchWindow(
+        name="tim_morning",
+        stop_id="place-masta",
+        stop_name="Massachusetts Ave",
+        direction_id=1,
+        direction_label="northbound towards Oak Grove",
+        start_hour=8,
+        end_hour=12,
+        ntfy_topic=NTFY_TOPIC_SELF,
+    ),
+    WatchWindow(
+        name="tim_afternoon",
+        stop_id="place-state",
+        stop_name="State",
+        direction_id=0,
+        direction_label="southbound towards Forest Hills",
+        start_hour=14,
+        end_hour=17,
+        ntfy_topic=NTFY_TOPIC_SELF,
+    ),
+]
 
 # ── MBTA API ──────────────────────────────────────────────────────────────────
 
-_http = requests.Session()
-_http.headers.update({"Accept": "application/vnd.api+json"})
+_mbta = requests.Session()
+_mbta.headers.update({"Accept": "application/vnd.api+json"})
 
 
-def mbta_get(path: str, params: dict | None = None) -> dict:
-    resp = _http.get(f"https://api-v3.mbta.com{path}", params=params, timeout=10)
-    resp.raise_for_status()
-    return resp.json()
+def _check_alerts(stop_id: str, direction_id: int) -> str | None:
+    """Returns the most severe active disruption effect from MBTA alerts, or None."""
+    data = _mbta.get(
+        "https://api-v3.mbta.com/alerts",
+        params={
+            "filter[route]": "Orange",
+            "filter[stop]": stop_id,
+            "filter[direction_id]": direction_id,
+            "filter[activity]": "BOARD,EXIT,RIDE",
+        },
+        timeout=10,
+    ).json()
 
-
-# ── Collectors ────────────────────────────────────────────────────────────────
-
-
-def collect_alerts() -> None:
-    data = mbta_get("/alerts", {
-        "filter[route]": "Orange",
-        "filter[stop]": ",".join(TARGET_STOPS.keys()),
-        "filter[activity]": "BOARD,EXIT,RIDE",
-    })
-
-    counts: dict[tuple[str, str], int] = {}
+    found: set[str] = set()
     for alert in data.get("data", []):
         attrs = alert.get("attributes", {})
         if attrs.get("lifecycle") not in ACTIVE_LIFECYCLES:
             continue
-        effect = attrs.get("effect", "UNKNOWN_EFFECT")
-        for entity in attrs.get("informed_entity", []):
-            stop_id = entity.get("stop")
-            if stop_id in TARGET_STOPS:
-                key = (TARGET_STOPS[stop_id], effect)
-                counts[key] = counts.get(key, 0) + 1
+        effect = attrs.get("effect", "")
+        if effect in DISRUPTION_EFFECTS:
+            found.add(effect)
 
-    _state.alert_counts = counts
-    if counts:
-        logger.info("alerts: %s", {f"{s}/{e}": c for (s, e), c in counts.items()})
-    else:
-        logger.info("alerts: none active at target stations")
+    for effect in SEVERITY:
+        if effect in found:
+            return effect
+    return None
 
 
-def collect_predictions() -> None:
-    data = mbta_get("/predictions", {
-        "filter[route]": "Orange",
-        "filter[stop]": ",".join(TARGET_STOPS.keys()),
-        "include": "schedule",
-        "sort": "arrival_time",
-        "page[limit]": "40",
-    })
+def _check_prediction_delay(stop_id: str, direction_id: int) -> bool:
+    """Returns True if the next predicted train is delayed beyond the threshold."""
+    data = _mbta.get(
+        "https://api-v3.mbta.com/predictions",
+        params={
+            "filter[route]": "Orange",
+            "filter[stop]": stop_id,
+            "filter[direction_id]": direction_id,
+            "include": "schedule",
+            "sort": "arrival_time",
+            "page[limit]": "5",
+        },
+        timeout=10,
+    ).json()
 
-    # Build schedule lookup from the included sidecar objects
-    schedules: dict[str, str | None] = {}
-    for item in data.get("included", []):
-        if item.get("type") == "schedule":
-            schedules[item["id"]] = item.get("attributes", {}).get("arrival_time")
+    schedules: dict[str, str | None] = {
+        item["id"]: item.get("attributes", {}).get("arrival_time")
+        for item in data.get("included", [])
+        if item.get("type") == "schedule"
+    }
 
-    now = datetime.now(timezone.utc)
-    next_train: dict[tuple[str, str], float] = {}
-    delay: dict[tuple[str, str], float] = {}
-
+    now = datetime.now(ZoneInfo("UTC"))
     for pred in data.get("data", []):
         attrs = pred.get("attributes", {})
         time_str = attrs.get("arrival_time") or attrs.get("departure_time")
-        direction_id = attrs.get("direction_id")
-        if time_str is None or direction_id is None:
+        if not time_str:
             continue
-
-        stop_id = (
-            pred.get("relationships", {})
-            .get("stop", {}).get("data", {}).get("id")
-        )
-        if stop_id not in TARGET_STOPS:
-            continue
-
         try:
             arrival_dt = datetime.fromisoformat(time_str)
         except (ValueError, TypeError):
             continue
-
-        minutes_away = (arrival_dt - now).total_seconds() / 60
-        if minutes_away < 0:
+        if (arrival_dt - now).total_seconds() < 0:
             continue  # already passed
 
-        station = TARGET_STOPS[stop_id]
-        direction = DIRECTION_LABELS.get(direction_id, "unknown")
-        key = (station, direction)
+        sched_rel = pred.get("relationships", {}).get("schedule", {}).get("data")
+        if sched_rel:
+            sched_arrival = schedules.get(sched_rel.get("id"))
+            if sched_arrival:
+                try:
+                    delay_s = (arrival_dt - datetime.fromisoformat(sched_arrival)).total_seconds()
+                    return delay_s >= DELAY_THRESHOLD_S
+                except (ValueError, TypeError):
+                    pass
+        break  # only examine the soonest upcoming train
 
-        if key not in next_train or minutes_away < next_train[key]:
-            next_train[key] = minutes_away
+    return False
 
-            sched_rel = (
-                pred.get("relationships", {})
-                .get("schedule", {}).get("data")
-            )
-            if sched_rel:
-                sched_arrival = schedules.get(sched_rel.get("id"))
-                if sched_arrival:
-                    try:
-                        sched_dt = datetime.fromisoformat(sched_arrival)
-                        delay[key] = (arrival_dt - sched_dt).total_seconds()
-                    except (ValueError, TypeError):
-                        pass
 
-    _state.next_train = next_train
-    _state.delay = delay
-    logger.info(
-        "predictions: %s | delays: %s",
-        {f"{s}/{d}": f"{m:.1f}min" for (s, d), m in next_train.items()},
-        {f"{s}/{d}": f"{sec:+.0f}s" for (s, d), sec in delay.items()},
+def get_disruption(stop_id: str, direction_id: int) -> str | None:
+    """
+    Returns the current disruption effect at this stop/direction, or None if clear.
+    Official MBTA alerts take priority; prediction-based delay is the fallback.
+    """
+    effect = _check_alerts(stop_id, direction_id)
+    if effect:
+        return effect
+    if _check_prediction_delay(stop_id, direction_id):
+        return "DELAY"
+    return None
+
+
+# ── ntfy.sh ───────────────────────────────────────────────────────────────────
+
+_ntfy = requests.Session()
+
+_EFFECT_LABEL: dict[str, str] = {
+    "DELAY": "significant delays (>10 min)",
+    "NO_SERVICE": "no service",
+    "SUSPENSION": "service suspended",
+    "STOP_CLOSURE": "stop closed",
+}
+
+
+def _ntfy_post(topic: str, title: str, body: str, priority: str, tags: list[str]) -> None:
+    _ntfy.post(
+        f"{NTFY_BASE}/{topic}",
+        data=body.encode(),
+        headers={
+            "Title": title,
+            "Priority": priority,
+            "Tags": ",".join(tags),
+        },
+        timeout=10,
+    ).raise_for_status()
+    logger.info("ntfy sent | topic=%s | %s", topic, title)
+
+
+def notify_disruption(window: WatchWindow, effect: str) -> None:
+    label = _EFFECT_LABEL.get(effect, effect.lower().replace("_", " "))
+    _ntfy_post(
+        topic=window.ntfy_topic,
+        title=f"Orange Line Alert — {window.stop_name}",
+        body=f"Trains {window.direction_label} from {window.stop_name} are experiencing {label}.",
+        priority="high",
+        tags=["rotating_light", "orange_circle"],
     )
+
+
+def notify_escalation(window: WatchWindow, new_effect: str) -> None:
+    label = _EFFECT_LABEL.get(new_effect, new_effect.lower().replace("_", " "))
+    _ntfy_post(
+        topic=window.ntfy_topic,
+        title=f"Orange Line Update — {window.stop_name}",
+        body=f"Update: trains {window.direction_label} from {window.stop_name} — now showing {label}.",
+        priority="high",
+        tags=["warning", "orange_circle"],
+    )
+
+
+def notify_resolved(window: WatchWindow) -> None:
+    _ntfy_post(
+        topic=window.ntfy_topic,
+        title=f"Orange Line Cleared — {window.stop_name}",
+        body=f"Trains {window.direction_label} from {window.stop_name} appear to be running normally again.",
+        priority="default",
+        tags=["white_check_mark", "orange_circle"],
+    )
+
+
+# ── Window Evaluation ─────────────────────────────────────────────────────────
+
+
+def is_active_window(window: WatchWindow, now_et: datetime) -> bool:
+    """True on weekdays within the window's configured hour range."""
+    return now_et.weekday() < 5 and window.start_hour <= now_et.hour < window.end_hour
+
+
+def evaluate_window(window: WatchWindow, now_et: datetime) -> None:
+    if not is_active_window(window, now_et):
+        if window.disrupted:
+            # Window closed while a disruption was active — reset silently
+            logger.info("[%s] window closed while disrupted — resetting state", window.name)
+            window.disrupted = False
+            window.disruption_effect = ""
+        return
+
+    with tracer.start_as_current_span(f"evaluate.{window.name}"):
+        try:
+            effect = get_disruption(window.stop_id, window.direction_id)
+        except Exception as exc:
+            logger.error("[%s] MBTA query failed: %s", window.name, exc)
+            return
+
+        if effect and not window.disrupted:
+            # New disruption detected
+            window.disrupted = True
+            window.disruption_effect = effect
+            try:
+                notify_disruption(window, effect)
+            except Exception as exc:
+                logger.error("[%s] ntfy failed (disruption): %s", window.name, exc)
+
+        elif effect and window.disrupted and effect != window.disruption_effect:
+            # Disruption escalated or changed character
+            window.disruption_effect = effect
+            try:
+                notify_escalation(window, effect)
+            except Exception as exc:
+                logger.error("[%s] ntfy failed (escalation): %s", window.name, exc)
+
+        elif not effect and window.disrupted:
+            # Disruption cleared within the active window
+            window.disrupted = False
+            window.disruption_effect = ""
+            try:
+                notify_resolved(window)
+            except Exception as exc:
+                logger.error("[%s] ntfy failed (resolution): %s", window.name, exc)
+
+        else:
+            logger.info(
+                "[%s] no change | disrupted=%s effect=%s",
+                window.name,
+                window.disrupted,
+                window.disruption_effect or "none",
+            )
 
 
 # ── Poll Loop ─────────────────────────────────────────────────────────────────
 
 
 def poll_once() -> None:
-    try:
-        collect_alerts()
-    except Exception as exc:
-        logger.error("alert collection failed: %s", exc)
-    try:
-        collect_predictions()
-    except Exception as exc:
-        logger.error("prediction collection failed: %s", exc)
+    now_et = datetime.now(ET)
+    with tracer.start_as_current_span("mbta.poll"):
+        for window in WATCH_WINDOWS:
+            evaluate_window(window, now_et)
 
 
 def main() -> None:
     logger.info(
-        "MBTA station monitor starting | stops=%s | poll=%ds | otlp=%s",
-        list(TARGET_STOPS.values()),
+        "MBTA commute monitor starting | poll=%ds | otlp=%s | sat=%s...",
         POLL_INTERVAL,
         OTLP_ENDPOINT,
+        DD_SAT[:8],
     )
 
     running = True
@@ -270,14 +384,13 @@ def main() -> None:
     try:
         while running:
             poll_once()
-            # Sleep in 1-second ticks so SIGTERM is handled promptly
             for _ in range(POLL_INTERVAL):
                 if not running:
                     break
                 time.sleep(1)
     finally:
-        logger.info("flushing metrics to Datadog...")
-        _meter_provider.shutdown()
+        logger.info("flushing traces to Datadog APM...")
+        _tracer_provider.shutdown()
         logger.info("stopped")
 
 
