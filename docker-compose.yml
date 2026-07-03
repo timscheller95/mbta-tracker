@@ -7,6 +7,9 @@ services:
     network_mode: host
     env_file: .env
     environment:
-      NTFY_TOPIC_WIFE: ${NTFY_TOPIC_WIFE}
-      NTFY_TOPIC_SELF: ${NTFY_TOPIC_SELF}
+      NTFY_TOPIC_1: ${NTFY_TOPIC_1}
+      NTFY_TOPIC_2: ${NTFY_TOPIC_2}
       POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-60}
+      DELAY_THRESHOLD_SECONDS: ${DELAY_THRESHOLD_SECONDS:-600}
+      DD_SERVICE: mbta-commute-monitor
+      DD_ENV: production

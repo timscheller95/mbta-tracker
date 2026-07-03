@@ -1,125 +1,75 @@
-# MBTA Orange Line Tracker
+# MBTA Orange Line Commute Monitor
 
-Real-time telemetry pipeline for the MBTA Orange Line, demonstrating production-grade observability with **OpenTelemetry**, **Grafana**, and **Datadog**.
+Runs on a Raspberry Pi Zero WH. Polls the MBTA V3 API during commute hours and sends push notifications via [ntfy.sh](https://ntfy.sh) when significant Orange Line disruptions (delays >10 min, no service, suspension) are detected or resolved. Datadog APM traces are emitted when notifications fire; the native Datadog Agent monitors container uptime via the Docker socket.
 
-## Architecture
+## How it works
 
-```
-                        ┌─────────────────────────────┐
-                        │       MBTA V3 REST API       │
-                        │  api-v3.mbta.com             │
-                        └────────────┬────────────────┘
-                                     │ polls every 30s
-                        ┌────────────▼────────────────┐
-                        │     Python Tracker Service   │
-                        │  · OTel traces (OTLP/HTTP)  │
-                        │  · OTel metrics (OTLP/HTTP) │
-                        └────────────┬────────────────┘
-                                     │ :4318
-                        ┌────────────▼────────────────┐
-                        │    OpenTelemetry Collector   │
-                        │         (Contrib)            │
-                        └────┬──────────────┬─────────┘
-                             │              │
-               ┌─────────────▼──┐    ┌──────▼──────────┐
-               │   Prometheus   │    │    Datadog       │
-               │   :8889/scrape │    │  (opt-in)        │
-               └───────┬────────┘    └─────────────────┘
-                       │
-               ┌───────▼────────┐
-               │    Grafana     │
-               │   :3000        │
-               └────────────────┘
+The tracker polls configurable watch windows on weekdays. Each window monitors a specific stop, direction, and time range. One notification fires when a disruption starts, one if it escalates, one when it clears. Windows reset silently if they close while a disruption is active.
+
+## Pi Setup (one-time)
+
+### 1. Install the native Datadog Agent
+
+The Datadog Agent Docker image does not support ARMv6 (Pi Zero WH). Install the native Agent instead:
+
+```sh
+DD_API_KEY=<your-api-key> DD_SITE=datadoghq.com \
+  bash -c "$(curl -L https://s3.amazonaws.com/dd-agent-bootstrap/datadog_agent7_raspberry.sh)"
 ```
 
-## Quick Start
+Enable on boot and grant Docker socket access so the Agent can monitor the container:
 
-```bash
+```sh
+sudo systemctl enable datadog-agent
+sudo usermod -a -G docker dd-agent
+sudo systemctl restart datadog-agent
+```
+
+The group membership and systemd enable both persist across reboots. The Agent will automatically report `docker.containers.running` and related metrics — create a Datadog monitor on that metric filtered to the `mbta-monitor` container to alert on container downtime.
+
+### 2. Install Docker
+
+```sh
+curl -fsSL https://get.docker.com | sh
+sudo usermod -a -G docker $USER   # optional: run docker without sudo
+sudo systemctl enable docker      # auto-start on reboot
+```
+
+### 3. Deploy the tracker
+
+```sh
+git clone <this-repo> && cd mbta-tracker
+git checkout pi-tracker
 cp .env.example .env
-# Optionally set MBTA_API_KEY and/or DD_API_KEY in .env
+# Fill in DD_API_KEY, NTFY_TOPIC_1, NTFY_TOPIC_2
 
 docker compose up -d
-
-# Grafana      → http://localhost:3000  (admin / mbta-tracker)
-# Prometheus   → http://localhost:9090
-# OTel health  → http://localhost:13133
 ```
 
-The Grafana dashboard is auto-provisioned under **MBTA → MBTA Orange Line Tracker**.
+The container has `restart: always` so it comes back automatically after a reboot. The container uses `network_mode: host` so `localhost:8126` reaches the native Agent's trace receiver.
 
-## Prerequisites
+## Configuration (`.env`)
 
-- Docker + Docker Compose
-- MBTA API key — [register free](https://api-v3.mbta.com/) to raise the anonymous rate limit (20 req/min)
-- Datadog account + API key (optional — see below)
-
-## Metrics Collected
-
-| OTel metric | Prometheus name | Description |
+| Variable | Default | Description |
 |---|---|---|
-| `mbta.vehicle.count` | `mbta_vehicle_count` | Active vehicles by direction |
-| `mbta.vehicle.status` | `mbta_vehicle_status` | Vehicles by stop status |
-| `mbta.vehicle.occupancy` | `mbta_vehicle_occupancy` | Vehicles by occupancy level |
-| `mbta.vehicle.speed` | `mbta_vehicle_speed_mph` | Speed histogram (mph) |
-| `mbta.vehicle.latitude` | `mbta_vehicle_latitude_deg` | Per-vehicle GPS latitude |
-| `mbta.vehicle.longitude` | `mbta_vehicle_longitude_deg` | Per-vehicle GPS longitude |
-| `mbta.alert.count` | `mbta_alert_count` | Active alerts total |
-| `mbta.alert.by_effect` | `mbta_alert_by_effect` | Alert counts by effect type and direction |
-| `mbta.alert.info` | `mbta_alert_info` | Info metric — one series per alert with human-readable `header` label |
-| `mbta.stop.alert` | `mbta_stop_alert` | Affected stations (1 = currently impacted) |
-| `mbta.headway` | `mbta_headway_seconds` | Average gap between trains at Downtown Crossing |
-| `mbta.api.request.duration` | `mbta_api_request_duration_seconds` | MBTA API latency histogram |
-| `mbta.api.requests` | `mbta_api_requests_total` | API requests by endpoint and status code |
-| `mbta.api.errors` | `mbta_api_errors_total` | API errors by endpoint and error type |
+| `DD_API_KEY` | required | Datadog API key (used by native Agent install and dev sidecar) |
+| `NTFY_TOPIC_1` | required | ntfy.sh topic for subscriber 1 |
+| `NTFY_TOPIC_2` | required | ntfy.sh topic for subscriber 2 |
+| `POLL_INTERVAL_SECONDS` | `60` | How often to poll MBTA API |
+| `DELAY_THRESHOLD_SECONDS` | `600` | Minimum delay (seconds) before alerting |
+| `NTFY_BASE_URL` | `https://ntfy.sh` | Override for self-hosted ntfy |
 
-Traces are also emitted: one parent span per poll cycle, one client span per MBTA API call (HTTP semantic conventions).
-
-## Datadog
-
-Datadog export is **disabled by default**. To enable it:
-
-1. Set `DD_API_KEY` (and optionally `DD_SITE`) in `.env`
-2. Uncomment the `datadog` exporter block in `otel-collector/config.yaml` and add it to the pipelines
-
-The Collector ships metrics as Datadog distributions (percentile-queryable) and traces with OTel span names.
-
-## OTel Design Notes
-
-- **Resource attributes** (`service.name`, `service.namespace`, `deployment.environment`, `mbta.route`) are promoted to Prometheus labels via `resource_to_telemetry_conversion`
-- **Observable gauges** use a callback pattern — shared `_State` is updated each poll cycle; the OTel SDK calls the callbacks on each metric export interval
-- **Info metric pattern** — `mbta.alert.info` is always value 1 with alert metadata as labels, enabling Grafana table panels to display free-text alert descriptions
-- **Graceful shutdown** — SIGTERM flushes the `BatchSpanProcessor` and `PeriodicExportingMetricReader` before exit
-
-## Project Structure
-
-```
-mbta-tracker/
-├── tracker/
-│   ├── main.py               # OTel-instrumented MBTA poller
-│   ├── requirements.txt
-│   ├── requirements-dev.txt
-│   ├── Dockerfile
-│   ├── pytest.ini
-│   ├── conftest.py
-│   └── tests/
-│       └── test_main.py      # 69 unit tests
-├── otel-collector/
-│   └── config.yaml           # Receiver + dual-ship pipeline
-├── prometheus/
-│   └── prometheus.yml
-├── grafana/
-│   └── provisioning/
-│       ├── datasources/
-│       └── dashboards/
-├── docker-compose.yml
-├── .env.example
-└── README.md
+Generate secure ntfy topics:
+```sh
+python3 -c "import secrets; print(secrets.token_hex(16))"
 ```
 
-## Running Tests
+## Local dev / testing
 
-```bash
-cd tracker
-pip install -r requirements-dev.txt
-pytest
+A dev compose file runs a Datadog Agent sidecar (amd64 only — not for the Pi):
+
+```sh
+docker compose -f docker-compose.dev.yml up -d datadog-agent
+docker compose -f docker-compose.dev.yml run --rm test
+docker compose -f docker-compose.dev.yml down
 ```
